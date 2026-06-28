@@ -231,12 +231,14 @@ class PhysioTokenizer(nn.Module):
             for band in config.freq_bands
         })
 
-        # Shared cross-modal codebook
-        self.shared_quantizer = ResidualVectorQuantizer(
-            codebook_size=config.shared_codebook_size,
-            codebook_dim=config.codebook_dim,
-            n_quantizers=config.n_quantizers,
-        )
+        # Shared cross-modal codebook (skip if size=0)
+        self.has_shared = config.shared_codebook_size > 0
+        if self.has_shared:
+            self.shared_quantizer = ResidualVectorQuantizer(
+                codebook_size=config.shared_codebook_size,
+                codebook_dim=config.codebook_dim,
+                n_quantizers=config.n_quantizers,
+            )
 
         # Adaptive boundary predictor
         if config.use_adaptive_boundaries:
@@ -247,9 +249,10 @@ class PhysioTokenizer(nn.Module):
 
     def _build_decoder(self) -> nn.Module:
         """Build decoder to reconstruct signal from quantized tokens."""
+        n_streams = len(self.config.freq_bands) + (1 if self.has_shared else 0)
         return nn.Sequential(
             nn.ConvTranspose1d(
-                self.config.codebook_dim * (len(self.config.freq_bands) + 1),
+                self.config.codebook_dim * n_streams,
                 self.config.codebook_dim,
                 kernel_size=4,
                 stride=2,
@@ -316,18 +319,18 @@ class PhysioTokenizer(nn.Module):
             total_commitment_loss += commitment
 
         # 3. Shared codebook (mixture with modality-specific)
-        shared_repr = sum(band_quantized.values()) / len(band_quantized)  # (B, D, T)
-        alpha = self._get_mixing_weight(shared_repr)  # (B, 1, T)
-
-        shared_q, shared_indices, shared_commitment = self.shared_quantizer(shared_repr)
-        total_commitment_loss += shared_commitment
-
-        # Mix: z_final = alpha * shared + (1-alpha) * band
         all_quantized = []
-        for band, z_q in band_quantized.items():
-            mixed = alpha * shared_q + (1 - alpha) * z_q
-            all_quantized.append(mixed)
-        all_quantized.append(shared_q)
+        if self.has_shared:
+            shared_repr = sum(band_quantized.values()) / len(band_quantized)  # (B, D, T)
+            alpha = self._get_mixing_weight(shared_repr)  # (B, 1, T)
+            shared_q, shared_indices, shared_commitment = self.shared_quantizer(shared_repr)
+            total_commitment_loss += shared_commitment
+            for band, z_q in band_quantized.items():
+                mixed = alpha * shared_q + (1 - alpha) * z_q
+                all_quantized.append(mixed)
+            all_quantized.append(shared_q)
+        else:
+            all_quantized = list(band_quantized.values())
 
         # 4. Adaptive boundary pooling
         if self.config.use_adaptive_boundaries and events is not None:
@@ -348,9 +351,10 @@ class PhysioTokenizer(nn.Module):
         result = {
             "x_recon": x_recon,
             "band_indices": band_indices,
-            "shared_indices": shared_indices,
             "commitment_loss": total_commitment_loss,
         }
+        if self.has_shared:
+            result["shared_indices"] = shared_indices
         if boundary_probs is not None:
             result["boundary_probs"] = boundary_probs
 
@@ -369,12 +373,14 @@ class PhysioTokenizer(nn.Module):
             _, indices, _ = self.band_quantizers[band](z)
             all_tokens[band] = indices
 
-        shared_repr = sum(band_reprs.values()) / len(band_reprs)
-        _, shared_indices, _ = self.shared_quantizer(shared_repr)
-        all_tokens["shared"] = shared_indices
+        if self.has_shared:
+            shared_repr = sum(band_reprs.values()) / len(band_reprs)
+            _, shared_indices, _ = self.shared_quantizer(shared_repr)
+            all_tokens["shared"] = shared_indices
 
         return all_tokens
 
     def get_vocabulary_size(self) -> int:
         """Total vocabulary size across all bands and shared codebook."""
-        return sum(self.config.codebook_sizes.values()) + self.config.shared_codebook_size
+        base = sum(self.config.codebook_sizes.values())
+        return base + (self.config.shared_codebook_size if self.has_shared else 0)
