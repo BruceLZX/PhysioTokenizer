@@ -43,7 +43,7 @@ logger = logging.getLogger("physiotokenizer")
 # KEEP-ALIVE HTTP SERVER (prevents HF Space from sleeping)
 # ============================================================
 
-KEEPALIVE_PORT = 7860
+KEEPALIVE_PORT = 8765
 
 class KeepAliveHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -64,10 +64,13 @@ KEEPALIVE_STATE = {"done": [], "current": "idle", "progress": "0%"}
 
 def start_keepalive():
     """Start a minimal HTTP server to prevent HF Space gcTimeout (1h)."""
-    server = HTTPServer(("0.0.0.0", KEEPALIVE_PORT), KeepAliveHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    logger.info(f"Keep-alive server on port {KEEPALIVE_PORT}")
+    try:
+        server = HTTPServer(("0.0.0.0", KEEPALIVE_PORT), KeepAliveHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        logger.info(f"Keep-alive server on port {KEEPALIVE_PORT}")
+    except OSError as e:
+        logger.warning(f"Keep-alive skipped (port conflict): {e}")
 
 # ============================================================
 # CONFIG DEFINITIONS
