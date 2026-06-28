@@ -178,7 +178,7 @@ ALL_RESULTS = {}  # accumulated across configs
 
 def setup():
     logger.info("=" * 60)
-    logger.info("PhysioTokenizer — 5-Config Experiment Pipeline")
+    logger.info("PhysioTokenizer — 6-Config Experiment Pipeline")
     logger.info("=" * 60)
 
     if not torch.cuda.is_available():
@@ -542,7 +542,7 @@ def evaluate_all(config_name: str, model: nn.Module, datasets: Dict,
                                             num_workers=2, pin_memory=True))
     X_te, y_te = encode_features(test_loader)
 
-    clf = LogisticRegression(max_iter=2000, C=1.0, n_jobs=-1)
+    clf = LogisticRegression(max_iter=2000, C=1.0)
     clf.fit(X_tr, y_tr)
     y_pred = clf.predict(X_te)
 
@@ -551,7 +551,7 @@ def evaluate_all(config_name: str, model: nn.Module, datasets: Dict,
 
     # Per-class F1
     class_names = ["NORM", "MI", "HYP", "STTC", "CD"]
-    per_class = f1_score(y_te, y_pred, average=None)
+    per_class = f1_score(y_te, y_pred, average=None, labels=list(range(5)))
     for cls_name, f1_val in zip(class_names, per_class):
         results[f"f1_{cls_name}"] = round(float(f1_val), 4)
 
@@ -619,7 +619,7 @@ def run_raw_signal_baseline(datasets: Dict) -> Dict:
         idx = np.random.choice(len(X_train), 50000, replace=False)
         X_train, y_train = X_train[idx], y_train[idx]
 
-    clf = LogisticRegression(max_iter=2000, C=1.0, n_jobs=-1)
+    clf = LogisticRegression(max_iter=2000, C=1.0)
     clf.fit(X_train, y_train)
     y_pred = clf.predict(X_test)
 
@@ -664,6 +664,7 @@ Best results in \textbf{bold}.}
         name = r["config"]
         desc_map = {
             "A_FlatVQ": "A: Flat VQ (baseline)",
+            "F_MultiScaleVQ": "F: Multi-Scale VQ (NeuroRVQ-style)",
             "B_FreqBandVQ": "B: Freq-Band VQ",
             "C_AdaptiveBoundary": "C: + Adaptive Boundaries",
             "D_PhysioTokenizerFull": r"\textbf{D: PhysioTokenizer (Full)}",
@@ -721,7 +722,7 @@ def generate_paper_figures(all_results: List[Dict]):
     figs_dir = Path("figures")
 
     config_names = [r["config"] for r in all_results]
-    colors = {"A": "#FF9800", "B": "#4CAF50", "C": "#2196F3", "D": "#9C27B0", "E": "#607D8B"}
+    colors = {"A": "#FF9800", "F": "#E91E63", "B": "#4CAF50", "C": "#2196F3", "D": "#9C27B0", "E": "#607D8B"}
 
     def get_val(configs, key, default=0):
         for r in all_results:
@@ -731,47 +732,8 @@ def generate_paper_figures(all_results: List[Dict]):
 
     # Fig 1: Reconstruction MSE comparison
     fig, ax = plt.subplots(figsize=(7, 3.5))
-    abcd = ["A_FlatVQ", "B_FreqBandVQ", "C_AdaptiveBoundary", "D_PhysioTokenizerFull"]
-    labels = ["Flat VQ", "Freq-Band VQ", "+ Adaptive\nBoundary", "PhysioTokenizer\n(Full)"]
-    mse_vals = [get_val([c], "recon_mse", 0.01) for c in abcd]
-    clrs = [colors[c[0]] for c in abcd]
-    bars = ax.bar(labels, mse_vals, color=clrs)
-    for b, v in zip(bars, mse_vals):
-        ax.text(b.get_x() + b.get_width()/2, b.get_height() + 0.0003,
-                f"{v:.4f}", ha="center", fontsize=9, fontweight="bold")
-    ax.set_ylabel("Reconstruction MSE")
-    ax.set_title("Figure 1: ECG Signal Reconstruction Quality")
-    fig.tight_layout()
-    fig.savefig(figs_dir / "fig1_reconstruction.pdf"); fig.savefig(figs_dir / "fig1_reconstruction.png")
-    plt.close(fig)
-    logger.info("  fig1_reconstruction ✓")
-
-    # Fig 2: Downstream accuracy + F1
-    fig, axes = plt.subplots(1, 2, figsize=(8, 3.5))
-    acc_vals = [get_val([c], "downstream_acc", 0.85) for c in abcd]
-    f1_vals = [get_val([c], "downstream_f1_macro", 0.8) for c in abcd]
-    raw_acc = get_val(["E_RawSignal"], "downstream_acc", 0.95)
-    x = np.arange(len(abcd))
-    axes[0].bar(labels, acc_vals, color=clrs)
-    axes[0].axhline(y=raw_acc, color="gray", linestyle="--", alpha=0.5, label=f"Raw Signal ({raw_acc:.3f})")
-    axes[0].set_ylabel("Accuracy"); axes[0].set_title("5-Class Classification")
-    axes[0].legend(fontsize=7)
-    axes[0].tick_params(axis='x', rotation=15)
-    axes[1].bar(labels, f1_vals, color=clrs)
-    axes[1].set_ylabel("F1 Macro"); axes[1].set_title("F1 Macro Score")
-    axes[1].tick_params(axis='x', rotation=15)
-    fig.suptitle("Figure 2: Downstream Classification (Linear Probe)", fontweight="bold")
-    fig.tight_layout()
-    fig.savefig(figs_dir / "fig2_downstream.pdf"); fig.savefig(figs_dir / "fig2_downstream.png")
-    plt.close(fig)
-    logger.info("  fig2_downstream ✓")
-
-    # Fig 3: Token compression efficiency
-    fig, ax = plt.subplots(figsize=(7, 3.5))
-    tok_vals = [get_val([c], "avg_tokens_per_segment", 300) for c in abcd]
-    fixed_patch = 5000 / 16
-    x = np.arange(len(abcd) + 1)
-    ax.bar(x[:-1], tok_vals, color=clrs, label="PhysioTokenizer Configs")
+    configs_order = ["A_FlatVQ", "F_MultiScaleVQ", "B_FreqBandVQ", "C_AdaptiveBoundary", "D_PhysioTokenizerFull"]
+    labels = ["Flat VQ", "Multi-Scale\nVQ", "Freq-Band\nVQ", "+ Adaptive\nBoundary", "PhysioTokenizer\n(Full)"]
     ax.bar(x[-1], fixed_patch, color="#FF5722", alpha=0.5, label="Fixed Patch (Sundial)")
     ax.set_xticks(x)
     ax.set_xticklabels(labels + ["Fixed\nPatch"])
@@ -802,12 +764,12 @@ def generate_paper_figures(all_results: List[Dict]):
 
     # Fig 5: R-peak detection & codebook usage
     fig, axes = plt.subplots(1, 2, figsize=(8, 3.5))
-    r_peak_vals = [get_val([c], "r_peak_f1", 0.85) for c in abcd]
+    r_peak_vals = [get_val([c], "r_peak_f1", 0.85) for c in configs_order]
     axes[0].bar(labels, r_peak_vals, color=clrs)
     axes[0].axhline(y=1.0, color="gray", linestyle="--", alpha=0.3, label="Perfect")
     axes[0].set_ylabel("R-Peak Detection F1"); axes[0].set_title("Diagnostic Feature Preservation")
     axes[0].tick_params(axis='x', rotation=15); axes[0].legend(fontsize=7)
-    codebook_vals = [get_val([c], "codebook_usage_ratio", 0.5) for c in abcd]
+    codebook_vals = [get_val([c], "codebook_usage_ratio", 0.5) for c in configs_order]
     axes[1].bar(labels, codebook_vals, color=clrs)
     axes[1].set_ylabel("Codebook Usage Ratio"); axes[1].set_title("Vocabulary Utilization")
     axes[1].set_ylim(0, 1.0); axes[1].tick_params(axis='x', rotation=15)
@@ -826,7 +788,7 @@ def generate_paper_figures(all_results: List[Dict]):
 
 def main():
     parser = argparse.ArgumentParser(description="PhysioTokenizer — Complete Experiment Pipeline")
-    parser.add_argument("--configs", nargs="+", default=["A", "B", "C", "D", "E"],
+    parser.add_argument("--configs", nargs="+", default=["A", "F", "B", "C", "D", "E"],
                         help="Which configs to run (default: all)")
     parser.add_argument("--skip-download", action="store_true",
                         help="Skip PTB-XL download")
