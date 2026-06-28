@@ -20,6 +20,8 @@ import logging
 import os
 import sys
 import time
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,6 +41,36 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger("physiotokenizer")
+
+# ============================================================
+# KEEP-ALIVE HTTP SERVER (prevents HF Space from sleeping)
+# ============================================================
+
+KEEPALIVE_PORT = 7860
+
+class KeepAliveHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        status = {
+            "status": "running",
+            "configs_completed": KEEPALIVE_STATE.get("done", []),
+            "current_config": KEEPALIVE_STATE.get("current", "idle"),
+            "progress": KEEPALIVE_STATE.get("progress", "0%"),
+        }
+        self.wfile.write(json.dumps(status).encode())
+    def log_message(self, format, *args):
+        pass  # suppress HTTP log noise
+
+KEEPALIVE_STATE = {"done": [], "current": "idle", "progress": "0%"}
+
+def start_keepalive():
+    """Start a minimal HTTP server to prevent HF Space gcTimeout (1h)."""
+    server = HTTPServer(("0.0.0.0", KEEPALIVE_PORT), KeepAliveHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logger.info(f"Keep-alive server on port {KEEPALIVE_PORT}")
 
 # ============================================================
 # CONFIG DEFINITIONS
@@ -144,6 +176,8 @@ def setup():
 
     for d in ["data", "datasets", "checkpoints", "results", "figures"]:
         Path(d).mkdir(parents=True, exist_ok=True)
+
+    start_keepalive()
 
 
 # ============================================================
@@ -835,6 +869,8 @@ def main():
 
     for config_key in args.configs:
         cfg = CONFIGS[config_key]
+        KEEPALIVE_STATE["current"] = config_key
+        KEEPALIVE_STATE["progress"] = f"{all_results.__len__()}/{len(args.configs)}"
         logger.info("\n" + "=" * 60)
         logger.info(f"RUNNING CONFIG {config_key}: {cfg.description}")
         logger.info("=" * 60)
@@ -878,6 +914,46 @@ def main():
     logger.info("  \\input{results/comparison_table.tex}")
     for i in range(1, 6):
         logger.info(f"  \\includegraphics[width=\\columnwidth]{{figures/fig{i}_*.pdf}}")
+
+    # Auto-push results to GitHub so data survives HF Space sleep
+    push_results_to_github()
+
+
+def push_results_to_github():
+    """Push results/ and figures/ to GitHub repo."""
+    token = os.environ.get("GITHUB_TOKEN", "")
+    if not token:
+        logger.warning("GITHUB_TOKEN not set — skipping auto-push to GitHub")
+        logger.warning("Set it in HF Space Settings → Repository secrets")
+        return
+
+    import subprocess
+
+    repo = "github.com/BruceLZX/PhysioTokenizer.git"
+    push_url = f"https://{token}@{repo}"
+
+    tmpdir = Path("/tmp/result_push")
+    subprocess.run(["rm", "-rf", str(tmpdir)], check=False)
+
+    logger.info("Pushing results to GitHub...")
+    try:
+        subprocess.run(["git", "clone", "--depth", "1", push_url, str(tmpdir)], check=True, capture_output=True)
+        subprocess.run(["cp", "-r", "results", str(tmpdir)], check=True)
+        subprocess.run(["cp", "-r", "figures", str(tmpdir)], check=True)
+
+        cwd = os.getcwd()
+        os.chdir(str(tmpdir))
+        subprocess.run(["git", "config", "user.email", "hf-space@physiotokenizer"], check=True)
+        subprocess.run(["git", "config", "user.name", "HF Space Bot"], check=True)
+        subprocess.run(["git", "add", "results/", "figures/"], check=True)
+        subprocess.run(["git", "commit", "-m", f"Experiment results ({time.strftime('%Y-%m-%d %H:%M')})"], check=False)
+        subprocess.run(["git", "push", "origin", "main"], check=True)
+        os.chdir(cwd)
+
+        logger.info("✅ Results pushed to GitHub: https://github.com/BruceLZX/PhysioTokenizer")
+        logger.info("   HF Space can sleep now — results are safe on GitHub")
+    except Exception as e:
+        logger.error(f"Failed to push results: {e}")
 
 
 if __name__ == "__main__":
