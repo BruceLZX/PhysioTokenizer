@@ -829,9 +829,24 @@ def main():
     logger.info("Loading PTB-XL...")
     datasets = load_ptbxl_from_wfdb(n_records=5000)
 
+    # Resume from previous run
     all_results = []
+    completed_names = set()
+    resume_path = Path("results/all_results.json")
+    if resume_path.exists():
+        with open(resume_path) as f:
+            all_results = json.load(f)
+        completed_names = {r["config"] for r in all_results}
+        logger.info(f"Resuming: {len(all_results)} configs already done ({completed_names})")
 
     for config_key in args.configs:
+        cfg = CONFIGS[config_key]
+        if cfg.name in completed_names:
+            logger.info(f"SKIPPING {config_key} ({cfg.name}): already completed")
+            continue
+        ckpt_path = Path(f"checkpoints/{cfg.name}_best.pt")
+        if ckpt_path.exists() and cfg.epochs > 0:
+            logger.info(f"Checkpoint exists for {cfg.name}, will skip training")
         cfg = CONFIGS[config_key]
         KEEPALIVE_STATE["current"] = config_key
         KEEPALIVE_STATE["progress"] = f"{len(all_results)}/{len(args.configs)}"
@@ -844,12 +859,15 @@ def main():
             all_results.append(results)
             continue
 
-        # Build & train
+        # Build & train (or load checkpoint)
         model = build_model(cfg)
-        train_info = train_model(model, datasets, cfg, seed=args.seed)
-
-        # Evaluate
-        model.load_state_dict(torch.load(train_info["ckpt_path"])["model_state_dict"])
+        if ckpt_path.exists() and cfg.epochs > 0:
+            logger.info(f"Loading existing checkpoint: {ckpt_path}")
+            model.load_state_dict(torch.load(ckpt_path, map_location=torch.device("cuda"))["model_state_dict"])
+            train_info = {"best_val_loss": 0.0, "best_epoch": 0, "ckpt_path": str(ckpt_path)}
+        else:
+            train_info = train_model(model, datasets, cfg, seed=args.seed)
+            model.load_state_dict(torch.load(train_info["ckpt_path"])["model_state_dict"])
         eval_results = evaluate_all(cfg.name, model, datasets, train_info, cfg)
         all_results.append(eval_results)
 
