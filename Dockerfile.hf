@@ -1,35 +1,27 @@
 # PhysioTokenizer — HuggingFace Space Dockerfile
-# Optimized for A10G GPU training + Gradio web UI
 
 FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 
-# System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     wget curl git \
     libsndfile1 libopenblas0 libopenblas-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# HF Spaces run as user 1000
+RUN useradd -m -u 1000 user
+USER user
+ENV PATH="/home/user/.local/bin:$PATH"
+
 WORKDIR /app
 
-# Python deps
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# HF Space specific
+COPY --chown=user requirements.txt .
+RUN pip install --no-cache-dir --upgrade -r requirements.txt
 RUN pip install --no-cache-dir gradio huggingface_hub
 
-# Copy project
-COPY . .
+COPY --chown=user . .
 
-# Pre-create directories
 RUN mkdir -p data datasets checkpoints results figures logs
 
-# Expose Gradio port
 EXPOSE 7860
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:7860/ || exit 1
-
-# Launch Gradio app
 CMD ["python", "app.py"]
