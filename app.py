@@ -57,25 +57,56 @@ def check_gpu() -> str:
 
 
 def run_training(config_name: str = "ecg_single_band", progress=gr.Progress()):
-    """Run PhysioTokenizer training."""
-    progress(0.1, desc="Checking environment...")
-    save_status({"phase": "training", "progress": 0.1, "message": f"Starting {config_name} training...", "started_at": time.strftime("%H:%M:%S")})
+    """Run full PhysioTokenizer pipeline: download → train → benchmark → figures."""
+    progress(0.05, desc="Checking GPU...")
+    save_status({"phase": "starting", "progress": 0.05, "message": f"Starting full pipeline ({config_name})...", "started_at": time.strftime("%H:%M:%S")})
 
-    progress(0.2, desc="Running training script...")
     try:
-        result = subprocess.run(
-            ["python", "scripts/run_on_hf.py", "--mode", "train", "--config", config_name],
-            capture_output=True, text=True, timeout=86400,  # 24h timeout
+        # Run the one-click pipeline script (stream output)
+        proc = subprocess.Popen(
+            ["python", "scripts/run_on_hf.py", "--config", config_name],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
         )
-        if result.returncode == 0:
-            save_status({"phase": "training_done", "progress": 1.0, "message": "Training complete!", "started_at": None})
-            return f"✅ Training completed!\n\n```\n{result.stdout[-2000:]}\n```"
+
+        output_lines = []
+        for line in proc.stdout:
+            output_lines.append(line)
+            # Update progress based on log markers
+            line_stripped = line.strip()
+            if "STEP 1" in line_stripped:
+                progress(0.1, desc="Downloading PTB-XL (3.5GB)...")
+            elif "STEP 2" in line_stripped:
+                progress(0.25, desc="Preprocessing ECG segments...")
+            elif "STEP 3" in line_stripped:
+                progress(0.35, desc="Training PhysioTokenizer (A100)...")
+            elif "Epoch" in line_stripped and "/100" in line_stripped:
+                try:
+                    epoch = int(line_stripped.split("Epoch")[1].split("/")[0].strip())
+                    progress(0.35 + 0.35 * (epoch / 100), desc=f"Training: epoch {epoch}/100")
+                except:
+                    pass
+            elif "STEP 4" in line_stripped:
+                progress(0.75, desc="Running benchmarks...")
+            elif "STEP 5" in line_stripped:
+                progress(0.90, desc="Generating figures...")
+
+        proc.wait(timeout=86400)
+        output_text = "".join(output_lines)
+
+        if proc.returncode == 0:
+            save_status({"phase": "complete", "progress": 1.0, "message": "✅ Pipeline complete!", "started_at": None})
+            return f"✅ Pipeline complete!\n\n```\n{output_text[-3000:]}\n```"
         else:
-            save_status({"phase": "error", "progress": 0, "message": "Training failed", "started_at": None})
-            return f"❌ Training failed:\n\n```\n{result.stderr[-2000:]}\n```"
+            save_status({"phase": "error", "progress": 0, "message": "Pipeline failed", "started_at": None})
+            return f"❌ Failed:\n\n```\n{output_text[-3000:]}\n```"
+
     except subprocess.TimeoutExpired:
         save_status({"phase": "error", "progress": 0, "message": "Timeout", "started_at": None})
-        return "⏰ Training timed out (24h limit)"
+        return "⏰ Timed out (24h limit)"
+    except Exception as e:
+        save_status({"phase": "error", "progress": 0, "message": str(e)[:100], "started_at": None})
+        return f"❌ Error: {e}"
 
 
 def run_benchmark(model_path: str = "checkpoints/physiotokenizer_best.pt", progress=gr.Progress()):
