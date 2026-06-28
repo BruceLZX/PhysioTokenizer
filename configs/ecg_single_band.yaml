@@ -1,0 +1,71 @@
+# PhysioTokenizer — Phase 1: Single-Modality ECG VQ
+# Minimal config for quick experimentation
+
+experiment:
+  name: "ecg_single_band_vq"
+  seed: 42
+  mixed_precision: true
+  log_every_n_steps: 50
+  save_every_n_epochs: 10
+
+data:
+  modality: "ecg"
+  datasets:
+    - name: "ptbxl"
+      path: "./data/ptbxl"
+      sampling_rate: 500
+      segment_duration_s: 10.0
+      stride_s: 5.0
+      n_leads: 12
+      tasks: ["diagnostic_classification"]
+    - name: "chapman"
+      path: "./data/chapman"
+      sampling_rate: 500
+      segment_duration_s: 10.0
+      stride_s: 5.0
+      n_leads: 12
+  val_split: 0.1
+  test_split: 0.1
+
+tokenizer:
+  n_channels: 12
+  segment_length: 5000  # 10s @ 500Hz
+  freq_bands:
+    delta: [0.5, 4]
+    theta: [4, 8]
+    alpha: [8, 13]
+    beta: [13, 30]
+    gamma: [30, 50]
+  codebook_sizes:
+    delta: 512
+    theta: 384
+    alpha: 384
+    beta: 256
+    gamma: 128
+  codebook_dim: 64
+  shared_codebook_size: 256
+  n_quantizers: 4
+  commitment_cost: 0.25
+  use_adaptive_boundaries: false  # Phase 2 adds this
+
+training:
+  batch_size: 32
+  epochs: 100
+  lr: 3.0e-4
+  weight_decay: 1.0e-5
+  warmup_steps: 1000
+  lr_scheduler: "cosine"
+  grad_clip_norm: 1.0
+  recon_loss_weight: 1.0
+  commit_loss_weight: 0.25
+  freq_consistency_weight: 0.1
+  entropy_weight: 0.01
+
+downstream:
+  linear_probe_epochs: 50
+  probe_lr: 1.0e-3
+  probe_layers: 2
+  probe_dim: 128
+  tasks:
+    - "diagnostic_classification"
+    - "rhythm_classification"

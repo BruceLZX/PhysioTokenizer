@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Data
+data/
+datasets/
+*.h5
+*.hd5
+*.hdf5
+*.wfdb
+*.hea
+*.dat
+
+# Models & checkpoints
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+wandb/
+
+# Results
+outputs/
+logs/
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# AAAI template (keep our paper, not template zip)
+paper/AuthorKit27/Word/
+paper/AuthorKit27/*.pdf
+paper/aaai27_author_kit.zip
+
+# Secrets
+.env
+.env.local
+*.secret
+
+# HF
+.cache/

@@ -1,0 +1,40 @@
+# PhysioTokenizer — Environment & Requirements
+
+# Core
+torch>=2.5.0
+torchvision>=0.20.0
+torchaudio>=2.5.0
+
+# MLX (Apple Silicon acceleration for local dev)
+mlx>=0.20.0
+mlx-lm>=0.20.0
+
+# Signal processing
+wfdb>=4.1.0          # PhysioNet data loading (ECG, EEG)
+mne>=1.8.0           # EEG/MEG processing
+neurokit2>=0.2.10    # Physiological signal processing (R-peak, HRV)
+PyWavelets>=1.6.0    # Continuous Wavelet Transform
+
+# Data
+numpy>=1.26.0
+scipy>=1.14.0
+pandas>=2.2.0
+h5py>=3.11.0
+
+# Vector quantization
+vector-quantize-pytorch>=1.20.0
+
+# Training & logging
+wandb>=0.18.0
+lightning>=2.4.0
+transformers>=4.45.0
+
+# Visualization
+matplotlib>=3.9.0
+seaborn>=0.13.0
+
+# Dev
+ipykernel>=6.29.0
+jupyter>=1.1.0
+pytest>=8.3.0
+pre-commit>=3.8.0
