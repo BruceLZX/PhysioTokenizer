@@ -46,7 +46,7 @@ def check_gpu() -> str:
         import torch
         if torch.cuda.is_available():
             name = torch.cuda.get_device_name(0)
-            vram = torch.cuda.get_device_properties(0).total_mem / 1e9
+            vram = torch.cuda.get_device_properties(0).total_memory / 1e9
             return f"✅ {name} ({vram:.1f} GB VRAM)"
         elif torch.backends.mps.is_available():
             return "⚠️ Apple MPS (limited VRAM)"
@@ -186,7 +186,7 @@ def preview_figure(fig_name: str) -> str:
 # Gradio UI
 # ============================================================
 
-with gr.Blocks(title="PhysioTokenizer", theme=gr.themes.Soft()) as demo:
+with gr.Blocks(title="PhysioTokenizer") as demo:
     gr.Markdown("""
     # 🫀 PhysioTokenizer
     ### Frequency-Aware Discrete Tokenization for Multimodal Physiological Signals
@@ -279,4 +279,4 @@ with gr.Blocks(title="PhysioTokenizer", theme=gr.themes.Soft()) as demo:
 
 if __name__ == "__main__":
     init()
-    demo.queue(default_concurrency_limit=1).launch(server_name="0.0.0.0", server_port=7860)
+    demo.queue(default_concurrency_limit=1).launch(server_name="0.0.0.0", server_port=7860, theme=gr.themes.Soft())
