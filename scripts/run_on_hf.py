@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
 """
-PhysioTokenizer — Complete 5-Config Experiment Pipeline
-Runs all experiments sequentially and produces a full comparison table.
+PhysioTokenizer — Complete 6-Config Experiment Pipeline
 
-Config A: Flat VQ (baseline) — single codebook, fixed patch, no freq bands
-Config B: Freq-Band VQ — 5 freq band codebooks, fixed patch
-Config C: + Adaptive Boundaries — Config B + adaptive token boundaries
-Config D: PhysioTokenizer Full — Config C + shared codebook + multi-lead
+Config A: Flat VQ (baseline) — single codebook, single kernel, fixed patch
+Config F: Multi-Scale VQ (NeuroRVQ-style) — multi-kernel branches → flat codebook
+Config B: Freq-Band VQ (Ours) — 5 explicit frequency-band codebooks
+Config C: + Adaptive Boundaries — B + physiological event-guided token boundaries
+Config D: PhysioTokenizer Full — C + shared codebook + multi-lead
 Config E: Raw Signal Linear Probe — performance ceiling
 
-Usage:
-    python scripts/run_on_hf.py                    # All 5 configs
-    python scripts/run_on_hf.py --configs A B      # Only A and B
-    python scripts/run_on_hf.py --skip-download    # Skip PTB-XL download
+Key ablation: F vs B answers "explicit biological bands > implicit multi-scale?"
 """
 import argparse
 import json
@@ -85,6 +82,7 @@ class ExperimentConfig:
     use_adaptive_boundaries: bool
     use_shared_codebook: bool
     use_multi_lead: bool
+    use_multi_scale: bool = False  # NeuroRVQ-style: multi-kernel conv → flat codebook
     codebook_dim: int = 64
     n_quantizers: int = 4
     epochs: int = 100
@@ -94,41 +92,56 @@ class ExperimentConfig:
 CONFIGS = {
     "A": ExperimentConfig(
         name="A_FlatVQ",
-        description="Baseline: single codebook, fixed patch, no freq bands",
+        description="Baseline: single codebook, single kernel, fixed patch",
         use_freq_bands=False,
         use_adaptive_boundaries=False,
         use_shared_codebook=False,
         use_multi_lead=False,
-        codebook_dim=256,  # larger dim to match total vocab of B/C/D
+        use_multi_scale=False,
+        codebook_dim=256,
+        epochs=80,
+    ),
+    "F": ExperimentConfig(
+        name="F_MultiScaleVQ",
+        description="NeuroRVQ-style: multi-kernel branches -> flat codebook (implicit freq)",
+        use_freq_bands=False,
+        use_adaptive_boundaries=False,
+        use_shared_codebook=False,
+        use_multi_lead=False,
+        use_multi_scale=True,
+        codebook_dim=256,
         epochs=80,
     ),
     "B": ExperimentConfig(
         name="B_FreqBandVQ",
-        description="Freq-Band VQ: 5 band-specific codebooks, fixed patch",
+        description="Freq-Band VQ: 5 explicit band-specific codebooks",
         use_freq_bands=True,
         use_adaptive_boundaries=False,
         use_shared_codebook=True,
         use_multi_lead=False,
+        use_multi_scale=False,
         codebook_dim=64,
         epochs=80,
     ),
     "C": ExperimentConfig(
         name="C_AdaptiveBoundary",
-        description="Freq-Band VQ + Adaptive Token Boundaries",
+        description="B + Adaptive Token Boundaries (physiological event-guided)",
         use_freq_bands=True,
         use_adaptive_boundaries=True,
         use_shared_codebook=True,
         use_multi_lead=False,
+        use_multi_scale=False,
         codebook_dim=64,
         epochs=80,
     ),
     "D": ExperimentConfig(
         name="D_PhysioTokenizerFull",
-        description="PhysioTokenizer Full: all features + multi-lead ECG",
+        description="Full: Freq-Band VQ + Adaptive Boundaries + Shared Codebook + Multi-Lead",
         use_freq_bands=True,
         use_adaptive_boundaries=True,
         use_shared_codebook=True,
         use_multi_lead=True,
+        use_multi_scale=False,
         codebook_dim=64,
         epochs=120,
     ),
@@ -139,8 +152,9 @@ CONFIGS = {
         use_adaptive_boundaries=False,
         use_shared_codebook=False,
         use_multi_lead=False,
-        codebook_dim=0,  # not used
-        epochs=0,  # no training, just probe
+        use_multi_scale=False,
+        codebook_dim=0,
+        epochs=0,
     ),
 }
 
@@ -181,135 +195,73 @@ def setup():
 
 
 # ============================================================
-# STEP 1: Download PTB-XL
+# STEP 1: Load PTB-XL from HuggingFace Datasets (fast, same CDN)
 # ============================================================
 
-def download_ptbxl() -> Path:
+def load_ptbxl_from_hf(n_records: int = 5000) -> Dict:
+    """Load PTB-XL directly from HuggingFace Datasets — no PhysioNet download needed."""
     logger.info("=" * 60)
-    logger.info("STEP 1: Downloading PTB-XL (~3.5GB)")
+    logger.info("STEP 1: Loading PTB-XL from HuggingFace Datasets")
     logger.info("=" * 60)
 
-    ptbxl_dir = Path("data/ptbxl")
-    records_dir = ptbxl_dir / "records100"
-    if records_dir.exists() and list(records_dir.glob("*.dat")):
-        n = len(list(records_dir.glob("*.dat")))
-        logger.info(f"PTB-XL already exists ({n} records)")
-        return ptbxl_dir
-
-    import subprocess
-    ptbxl_dir.mkdir(parents=True, exist_ok=True)
-    logger.info("Downloading via wget (10-20 min)...")
-    subprocess.run([
-        "wget", "-q", "-r", "-N", "-np", "-nH", "--cut-dirs=3",
-        "https://physionet.org/files/ptb-xl/1.0.3/",
-        "-P", str(ptbxl_dir),
-    ], check=False, timeout=3600)
-
-    records = list(ptbxl_dir.rglob("*.dat"))
-    logger.info(f"Downloaded {len(records)} records")
-    return ptbxl_dir
-
-
-# ============================================================
-# STEP 2: Preprocess & Load PTB-XL Labels
-# ============================================================
-
-def load_ptbxl_metadata(ptbxl_dir: Path) -> Dict[str, str]:
-    """Load PTB-XL diagnostic labels from ptbxl_database.csv."""
-    import pandas as pd
-
-    csv_path = ptbxl_dir / "ptbxl_database.csv"
-    if not csv_path.exists():
-        # Try recursive search
-        csv_candidates = list(ptbxl_dir.rglob("ptbxl_database.csv"))
-        if csv_candidates:
-            csv_path = csv_candidates[0]
-        else:
-            logger.warning("ptbxl_database.csv not found! Labels will be 0.")
-            return {}
-
-    df = pd.read_csv(csv_path)
-    # Map: ecg_id filename → diagnostic_class
-    # PTB-XL diagnostic_class: NORM, MI, HYP, STTC, CD
-    label_map = {}
-    for _, row in df.iterrows():
-        fname = row.get("filename_hr", row.get("filename_lr", str(row.get("ecg_id", ""))))
-        scp = str(row.get("diagnostic_class", "NORM"))
-        label_map[fname] = scp
-
-    logger.info(f"Loaded {len(label_map)} labels ({len(set(label_map.values()))} classes)")
-    return label_map
-
-
-def preprocess_data(ptbxl_dir: Path, use_multi_lead: bool) -> Dict[str, DataLoader]:
-    """Preprocess PTB-XL into train/val/test with REAL diagnostic labels."""
-    import wfdb
+    from datasets import load_dataset
     import neurokit2 as nk
 
-    logger.info("Preprocessing PTB-XL with real labels...")
+    logger.info("Loading ptb-xl dataset from HF Hub (cached, fast)...")
+    ds = load_dataset("ptb-xl", trust_remote_code=True, split=f"train[:{n_records}]")
+    logger.info(f"Loaded {len(ds)} records")
 
-    label_map = load_ptbxl_metadata(ptbxl_dir)
     label_to_idx = {"NORM": 0, "MI": 1, "HYP": 2, "STTC": 3, "CD": 4}
-
     segments = []
     labels = []
     r_peak_counts = []
     n_processed = 0
     n_skipped = 0
-    fs = 500  # target sampling rate
+    fs_target = 500
 
-    dat_files = sorted(ptbxl_dir.rglob("*.dat"))[:8000]  # up to 8000 records
-    logger.info(f"Processing up to {len(dat_files)} records...")
-
-    for dat_path in dat_files:
+    for i, record in enumerate(ds):
         try:
-            rec_name = str(dat_path.with_suffix(""))
-            rec = wfdb.rdrecord(rec_name)
-            sig_raw = rec.p_signal.astype(np.float32)
-            rec_fs = rec.fs
+            # Extract ECG signal — shape (n_samples, n_leads) or (n_leads, n_samples)
+            sig_raw = np.array(record["ecg"], dtype=np.float32)
+
+            # Handle shape: HF dataset might be (n_leads, n_samples) or (n_samples, n_leads)
+            if sig_raw.shape[0] < sig_raw.shape[1]:
+                sig_raw = sig_raw.T  # (n_samples, n_leads)
+
             n_channels = sig_raw.shape[1]
+            rec_fs = int(record.get("fs", 500))
 
             # Get label
-            ecg_id = dat_path.stem
-            diag_class = label_map.get(ecg_id, "NORM")
-            label = label_to_idx.get(diag_class, 0)
+            diag = str(record.get("diagnostic_class", "NORM"))
+            label = label_to_idx.get(diag, 0)
 
-            # Select leads
-            if use_multi_lead and n_channels >= 3:
-                # Use leads I, II, V2 (or first 3 available)
-                lead_indices = list(range(min(3, n_channels)))
-            else:
-                lead_indices = [0]  # Lead I only
+            # Use first 3 leads if multi-lead, else lead I
+            n_use = min(3, n_channels) if use_multi_lead_ds else 1
+            sig = sig_raw[:, :n_use]  # (T, n_use)
 
-            sig = sig_raw[:, lead_indices]  # (T, n_leads)
-
-            # Normalize per-lead
-            for ld in range(sig.shape[1]):
-                ch = sig[:, ld]
-                ch = (ch - ch.mean()) / (ch.std() + 1e-8)
-                sig[:, ld] = ch
+            # Normalize
+            sig = (sig - sig.mean(axis=0)) / (sig.std(axis=0) + 1e-8)
 
             # Resample to 500Hz if needed
-            if rec_fs != fs:
+            if rec_fs != fs_target:
                 from scipy import signal as scisig
-                n_target = int(sig.shape[0] * fs / rec_fs)
-                resampled = np.zeros((n_target, sig.shape[1]), dtype=np.float32)
-                for ld in range(sig.shape[1]):
-                    resampled[:, ld] = scisig.resample(sig[:, ld], n_target)
-                sig = resampled
+                n_target = int(sig.shape[0] * fs_target / rec_fs)
+                sig = np.array([scisig.resample(sig[:, j], n_target) for j in range(sig.shape[1])]).T
 
             # Extract 10-second segments
-            seg_len = int(10.0 * fs)  # 5000
-            for start in range(0, len(sig) - seg_len + 1, seg_len // 2):
-                seg = sig[start:start + seg_len].copy()
+            seg_len = int(10.0 * fs_target)
+            if sig.shape[0] < seg_len:
+                sig = np.pad(sig, ((0, seg_len - sig.shape[0]), (0, 0)))
 
+            for start in range(0, sig.shape[0] - seg_len + 1, max(seg_len // 2, 1)):
+                seg = sig[start:start + seg_len].copy()
                 if len(seg) < seg_len:
                     seg = np.pad(seg, ((0, seg_len - len(seg)), (0, 0)))
                 seg = seg[:seg_len]
 
-                # R-peak detection on lead I (channel 0)
+                # R-peak detection
                 try:
-                    _, info = nk.ecg_process(seg[:, 0], sampling_rate=fs)
+                    _, info = nk.ecg_process(seg[:, 0], sampling_rate=fs_target)
                     n_peaks = len(info["ECG_R_Peaks"])
                 except Exception:
                     n_peaks = 5
@@ -319,56 +271,56 @@ def preprocess_data(ptbxl_dir: Path, use_multi_lead: bool) -> Dict[str, DataLoad
                 r_peak_counts.append(n_peaks)
                 n_processed += 1
 
-        except Exception as e:
+                # Limit total segments to avoid memory explosion
+                if n_processed >= 30000:
+                    break
+
+        except Exception:
             n_skipped += 1
-            if n_skipped < 5:
-                logger.debug(f"  Skipped {dat_path.name}: {e}")
             continue
 
-        if n_processed % 1000 == 0:
-            logger.info(f"  {n_processed} segments...")
+        if n_processed >= 30000:
+            break
+        if (i + 1) % 500 == 0:
+            logger.info(f"  {i+1}/{len(ds)} records → {n_processed} segments...")
 
     logger.info(f"Done: {n_processed} segments, {n_skipped} skipped")
     unique, counts = np.unique(labels, return_counts=True)
     class_names = ["NORM", "MI", "HYP", "STTC", "CD"]
     for cls_id, cnt in zip(unique, counts):
-        logger.info(f"  Class {class_names[cls_id]}: {cnt} segments ({100*cnt/len(labels):.1f}%)")
+        logger.info(f"  Class {class_names[cls_id]}: {cnt} ({100*cnt/max(len(labels),1):.1f}%)")
 
-    # Stack
-    seg_array = np.stack(segments)  # (N, T, C)
-    n_leads_actual = seg_array.shape[2]
-
-    # Pad channels to model's expected n_channels
-    target_ch = 12
-    if n_leads_actual < target_ch:
-        pad_ch = np.zeros((seg_array.shape[0], seg_array.shape[1], target_ch - n_leads_actual),
-                          dtype=np.float32)
-        seg_array = np.concatenate([seg_array, pad_ch], axis=2)
+    # Stack and pad channels to 12
+    seg_array = np.stack(segments)
+    n_channels_actual = seg_array.shape[2]
+    if n_channels_actual < 12:
+        pad = np.zeros((seg_array.shape[0], seg_array.shape[1], 12 - n_channels_actual), dtype=np.float32)
+        seg_array = np.concatenate([seg_array, pad], axis=2)
 
     X = torch.from_numpy(seg_array).permute(0, 2, 1)  # (N, 12, 5000)
     y = torch.tensor(labels, dtype=torch.long)
 
-    # Train/val/test split (80/10/10, stratified)
+    # Stratified split
     from sklearn.model_selection import train_test_split
-    n = len(segments)
-    idx = np.arange(n)
+    idx = np.arange(len(segments))
     idx_train, idx_test = train_test_split(idx, test_size=0.2, stratify=labels, random_state=42)
-    idx_val, idx_test = train_test_split(idx_test, test_size=0.5, stratify=np.array(labels)[idx_test], random_state=42)
-
-    datasets = {
-        "train": TensorDataset(X[idx_train], y[idx_train]),
-        "val": TensorDataset(X[idx_val], y[idx_val]),
-        "test": TensorDataset(X[idx_test], y[idx_test]),
-        "X_test": X[idx_test],   # raw tensor for raw-signal probe
-        "y_test": y[idx_test],
-        "X_train": X[idx_train],
-        "y_train": y[idx_train],
-    }
+    idx_val, idx_test = train_test_split(idx_test, test_size=0.5,
+                                          stratify=np.array(labels)[idx_test], random_state=42)
 
     logger.info(f"Train: {len(idx_train)} | Val: {len(idx_val)} | Test: {len(idx_test)}")
     logger.info(f"Avg R-peaks/segment: {np.mean(r_peak_counts):.1f}")
 
-    return datasets
+    return {
+        "train": TensorDataset(X[idx_train], y[idx_train]),
+        "val": TensorDataset(X[idx_val], y[idx_val]),
+        "test": TensorDataset(X[idx_test], y[idx_test]),
+        "X_test": X[idx_test], "y_test": y[idx_test],
+        "X_train": X[idx_train], "y_train": y[idx_train],
+    }
+
+
+# Global flag for multi-lead — set before load_ptbxl_from_hf
+use_multi_lead_ds = False
 
 
 # ============================================================
@@ -376,7 +328,7 @@ def preprocess_data(ptbxl_dir: Path, use_multi_lead: bool) -> Dict[str, DataLoad
 # ============================================================
 
 def build_model(cfg: ExperimentConfig) -> nn.Module:
-    """Build PhysioTokenizer model for a given config."""
+    """Build PhysioTokenizer or baseline model for a given config."""
     from src.tokenizer.physio_vq import PhysioTokenizer, TokenizerConfig
 
     tcfg = TokenizerConfig()
@@ -386,14 +338,21 @@ def build_model(cfg: ExperimentConfig) -> nn.Module:
     tcfg.n_quantizers = cfg.n_quantizers
     tcfg.use_adaptive_boundaries = cfg.use_adaptive_boundaries
 
-    if not cfg.use_freq_bands:
-        # Flat VQ: single codebook matching total token budget
+    if cfg.use_multi_scale:
+        # NeuroRVQ-style: multi-kernel encoder → single flat codebook
+        tcfg.freq_bands = {"multi_scale": (0.5, 50)}
+        tcfg.codebook_sizes = {"multi_scale": sum(b["codebook_size"] for b in FREQ_BAND_CONFIGS.values())}
+        tcfg.multi_scale_kernels = [21, 15, 9, 5]  # NeuroRVQ-style per-branch kernels
+    elif not cfg.use_freq_bands:
+        # Flat VQ: single codebook
         total_vocab = sum(b["codebook_size"] for b in FREQ_BAND_CONFIGS.values())
         tcfg.freq_bands = {"flat": (0.5, 50)}
         tcfg.codebook_sizes = {"flat": total_vocab}
+        tcfg.multi_scale_kernels = None
     else:
         tcfg.freq_bands = {k: v["range"] for k, v in FREQ_BAND_CONFIGS.items()}
         tcfg.codebook_sizes = {k: v["codebook_size"] for k, v in FREQ_BAND_CONFIGS.items()}
+        tcfg.multi_scale_kernels = None
 
     if not cfg.use_shared_codebook:
         tcfg.shared_codebook_size = 0
@@ -854,35 +813,32 @@ def main():
     setup()
 
     # Download data
-    if not args.skip_download:
-        ptbxl_dir = download_ptbxl()
-    else:
-        ptbxl_dir = Path("data/ptbxl")
-
-    # Shared test set from Config A's data pipeline
-    # For C and D, we need different preprocessing (multi-lead)
-    logger.info("Preprocessing datasets for all configs...")
-    datasets_single_lead = preprocess_data(ptbxl_dir, use_multi_lead=False)
-    datasets_multi_lead = preprocess_data(ptbxl_dir, use_multi_lead=True) if "D" in args.configs else None
+    logger.info("Preprocessing datasets...")
+    datasets_single = load_ptbxl_from_hf(n_records=5000)
+    datasets_multi = None
 
     all_results = []
 
     for config_key in args.configs:
         cfg = CONFIGS[config_key]
         KEEPALIVE_STATE["current"] = config_key
-        KEEPALIVE_STATE["progress"] = f"{all_results.__len__()}/{len(args.configs)}"
+        KEEPALIVE_STATE["progress"] = f"{len(all_results)}/{len(args.configs)}"
         logger.info("\n" + "=" * 60)
         logger.info(f"RUNNING CONFIG {config_key}: {cfg.description}")
         logger.info("=" * 60)
 
         if config_key == "E":
-            # Raw signal baseline — no training needed
-            results = run_raw_signal_baseline(datasets_single_lead)
+            results = run_raw_signal_baseline(datasets_single)
             all_results.append(results)
             continue
 
-        # Choose dataset
-        datasets = datasets_multi_lead if cfg.use_multi_lead else datasets_single_lead
+        # Use multi-lead for Config D
+        global use_multi_lead_ds
+        if cfg.use_multi_lead and datasets_multi is None:
+            use_multi_lead_ds = True
+            datasets_multi = load_ptbxl_from_hf(n_records=5000)
+            use_multi_lead_ds = False
+        datasets = datasets_multi if cfg.use_multi_lead else datasets_single
 
         # Build & train
         model = build_model(cfg)

@@ -28,6 +28,7 @@ class TokenizerConfig:
     codebook_sizes: Dict[str, int] = None
     codebook_dim: int = 64  # Dimension of each codebook vector
     shared_codebook_size: int = 256
+    multi_scale_kernels: Optional[List[int]] = None  # NeuroRVQ-style multi-kernel branches
     n_quantizers: int = 4  # Residual quantization depth
 
     # Adaptive boundaries
@@ -71,33 +72,45 @@ class FrequencyBandEncoder(nn.Module):
         super().__init__()
         self.config = config
         self.band_encoders = nn.ModuleDict()
+        self.is_multi_scale = config.multi_scale_kernels is not None
 
-        for band_name, (f_low, f_high) in config.freq_bands.items():
-            # 1D CNN per band: different kernel sizes for different frequencies
-            kernel_size = int(500 / f_low)  # Larger kernels for lower frequencies
-            kernel_size = max(3, min(kernel_size, 251))  # Clamp to reasonable range
-            if kernel_size % 2 == 0:
-                kernel_size += 1  # Make odd
+        if self.is_multi_scale:
+            # NeuroRVQ-style: one branch per kernel size, all feed into SAME flat codebook
+            self.multi_scale_branches = nn.ModuleList()
+            for ks in config.multi_scale_kernels:
+                if ks % 2 == 0:
+                    ks += 1
+                self.multi_scale_branches.append(nn.Sequential(
+                    nn.Conv1d(config.n_channels, config.codebook_dim, kernel_size=ks,
+                              stride=1, padding=ks // 2),
+                    nn.GroupNorm(8, config.codebook_dim),
+                    nn.GELU(),
+                ))
+            # Fusion: concatenate branch outputs → project to codebook_dim
+            n_branches = len(config.multi_scale_kernels)
+            self.fusion = nn.Conv1d(config.codebook_dim * n_branches, config.codebook_dim,
+                                    kernel_size=1)
+            # Single encoder slot for the fused output
+            self.band_encoders["multi_scale"] = nn.Identity()
+        else:
+            for band_name, (f_low, f_high) in config.freq_bands.items():
+                kernel_size = int(500 / f_low)
+                kernel_size = max(3, min(kernel_size, 251))
+                if kernel_size % 2 == 0:
+                    kernel_size += 1
 
-            self.band_encoders[band_name] = nn.Sequential(
-                nn.Conv1d(
-                    config.n_channels,
-                    config.codebook_dim,
-                    kernel_size=kernel_size,
-                    stride=1,
-                    padding=kernel_size // 2,
-                ),
-                nn.GroupNorm(8, config.codebook_dim),
-                nn.GELU(),
-            )
+                self.band_encoders[band_name] = nn.Sequential(
+                    nn.Conv1d(config.n_channels, config.codebook_dim,
+                              kernel_size=kernel_size, stride=1, padding=kernel_size // 2),
+                    nn.GroupNorm(8, config.codebook_dim),
+                    nn.GELU(),
+                )
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        Args:
-            x: (B, C, T) input signal
-        Returns:
-            Dict mapping band_name -> (B, D, T) band representation
-        """
+        if self.is_multi_scale:
+            branch_outputs = [branch(x) for branch in self.multi_scale_branches]
+            fused = self.fusion(torch.cat(branch_outputs, dim=1))
+            return {"multi_scale": fused}
         return {band: encoder(x) for band, encoder in self.band_encoders.items()}
 
 
