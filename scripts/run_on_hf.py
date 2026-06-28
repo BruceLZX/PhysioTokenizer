@@ -508,13 +508,21 @@ def evaluate_all(config_name: str, model: nn.Module, datasets: Dict,
         feats, labs = [], []
         for x_b, y_b in loader:
             x_b = x_b.to(device)
+            B = len(x_b)
             with torch.no_grad():
                 tokens = model.encode(x_b)
-            # Mean-pool all token embeddings across time and bands
+            # tokens: dict[band_name -> indices (B*T, N_q)]
+            # Reshape to (B, T, N_q), pool to (B, N_q), concat bands
             all_tok = []
             for t in tokens.values():
-                all_tok.append(t.float().mean(dim=-1))  # (B, n_quantizers)
-            f = torch.cat(all_tok, dim=1).cpu().numpy()
+                tok = t.float()  # (B*T, N_q)
+                if tok.dim() == 1:
+                    tok = tok.unsqueeze(1)
+                N_q = tok.shape[1]
+                T = tok.shape[0] // B
+                tok_r = tok.reshape(B, T, N_q).mean(dim=1)  # (B, N_q)
+                all_tok.append(tok_r)
+            f = torch.cat(all_tok, dim=1).cpu().numpy()  # (B, sum N_q)
             feats.append(f)
             labs.append(y_b.numpy())
         return np.concatenate(feats), np.concatenate(labs)
