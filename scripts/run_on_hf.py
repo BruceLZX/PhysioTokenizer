@@ -201,70 +201,88 @@ def setup():
 # STEP 1: Load PTB-XL from HuggingFace Datasets (fast, same CDN)
 # ============================================================
 
-def load_ptbxl_from_hf(n_records: int = 5000) -> Dict:
-    """Load PTB-XL directly from HuggingFace Datasets — no PhysioNet download needed."""
+def load_ptbxl_from_wfdb(n_records: int = 5000) -> Dict:
+    """Load PTB-XL via wfdb download + preprocess into segments."""
     logger.info("=" * 60)
-    logger.info("STEP 1: Loading PTB-XL from HuggingFace Datasets")
+    logger.info("STEP 1: Loading PTB-XL via wfdb")
     logger.info("=" * 60)
 
-    from datasets import load_dataset
+    import wfdb
     import neurokit2 as nk
 
-    logger.info("Loading ptb-xl dataset from HF Hub (cached, fast)...")
-    ds = load_dataset("ptb-xl", trust_remote_code=True, split=f"train[:{n_records}]")
-    logger.info(f"Loaded {len(ds)} records")
+    data_dir = Path("data/ptbxl")
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    # Download if needed
+    dat_files = list(data_dir.rglob("*.dat"))
+    if len(dat_files) < 1000:
+        logger.info("Downloading PTB-XL via wfdb (~3.5GB, 20-40min)...")
+        try:
+            wfdb.dl_database("ptb-xl", dl_dir=str(data_dir))
+        except Exception as e:
+            logger.warning(f"wfdb download failed: {e}")
+            # Fallback: direct zip
+            import subprocess
+            zip_path = data_dir / "ptbxl.zip"
+            logger.info("Trying direct zip download...")
+            subprocess.run([
+                "wget", "-q", "--show-progress",
+                "https://physionet.org/static/published-projects/ptb-xl/ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.3.zip",
+                "-O", str(zip_path),
+            ], check=False)
+            if zip_path.exists():
+                subprocess.run(["unzip", "-q", "-o", str(zip_path), "-d", str(data_dir)], check=False)
+                zip_path.unlink(missing_ok=True)
+
+    dat_files = sorted(data_dir.rglob("*.dat"))
+    logger.info(f"Available: {len(dat_files)} records")
 
     label_to_idx = {"NORM": 0, "MI": 1, "HYP": 2, "STTC": 3, "CD": 4}
-    segments = []
-    labels = []
-    r_peak_counts = []
-    n_processed = 0
-    n_skipped = 0
+    segments, labels, r_peak_counts = [], [], []
+    n_processed, n_skipped = 0, 0
     fs_target = 500
 
-    for i, record in enumerate(ds):
+    rec_limit = min(len(dat_files), n_records)
+    logger.info(f"Processing {rec_limit} records...")
+
+    for dat_path in dat_files[:rec_limit]:
         try:
-            # Extract ECG signal — shape (n_samples, n_leads) or (n_leads, n_samples)
-            sig_raw = np.array(record["ecg"], dtype=np.float32)
+            rec = wfdb.rdrecord(str(dat_path.with_suffix("")))
+            sig_raw = rec.p_signal.astype(np.float32)
+            rec_fs = rec.fs
 
-            # Handle shape: HF dataset might be (n_leads, n_samples) or (n_samples, n_leads)
-            if sig_raw.shape[0] < sig_raw.shape[1]:
-                sig_raw = sig_raw.T  # (n_samples, n_leads)
+            # Try to get label from filename
+            label = 0  # default NORM
+            if hasattr(rec, 'comments') and rec.comments:
+                for c in rec.comments:
+                    c_upper = str(c).upper()
+                    for cls_name, cls_id in label_to_idx.items():
+                        if cls_name in c_upper:
+                            label = cls_id
+                            break
 
-            n_channels = sig_raw.shape[1]
-            rec_fs = int(record.get("fs", 500))
+            # Lead I only (channel 0)
+            sig = sig_raw[:, 0:1]
+            sig = (sig - sig.mean()) / (sig.std() + 1e-8)
 
-            # Get label
-            diag = str(record.get("diagnostic_class", "NORM"))
-            label = label_to_idx.get(diag, 0)
-
-            # Use first 3 leads if multi-lead, else lead I
-            n_use = min(3, n_channels) if use_multi_lead_ds else 1
-            sig = sig_raw[:, :n_use]  # (T, n_use)
-
-            # Normalize
-            sig = (sig - sig.mean(axis=0)) / (sig.std(axis=0) + 1e-8)
-
-            # Resample to 500Hz if needed
+            # Resample
             if rec_fs != fs_target:
                 from scipy import signal as scisig
                 n_target = int(sig.shape[0] * fs_target / rec_fs)
-                sig = np.array([scisig.resample(sig[:, j], n_target) for j in range(sig.shape[1])]).T
+                sig = scisig.resample(sig[:, 0], n_target).reshape(-1, 1)
 
-            # Extract 10-second segments
             seg_len = int(10.0 * fs_target)
             if sig.shape[0] < seg_len:
                 sig = np.pad(sig, ((0, seg_len - sig.shape[0]), (0, 0)))
 
             for start in range(0, sig.shape[0] - seg_len + 1, max(seg_len // 2, 1)):
-                seg = sig[start:start + seg_len].copy()
+                seg = sig[start:start + seg_len, 0].copy()
                 if len(seg) < seg_len:
-                    seg = np.pad(seg, ((0, seg_len - len(seg)), (0, 0)))
+                    seg = np.pad(seg, (0, seg_len - len(seg)))
                 seg = seg[:seg_len]
 
-                # R-peak detection
                 try:
-                    _, info = nk.ecg_process(seg[:, 0], sampling_rate=fs_target)
+                    _, info = nk.ecg_process(seg, sampling_rate=fs_target)
                     n_peaks = len(info["ECG_R_Peaks"])
                 except Exception:
                     n_peaks = 5
@@ -273,46 +291,34 @@ def load_ptbxl_from_hf(n_records: int = 5000) -> Dict:
                 labels.append(label)
                 r_peak_counts.append(n_peaks)
                 n_processed += 1
-
-                # Limit total segments to avoid memory explosion
-                if n_processed >= 30000:
+                if n_processed >= 20000:
                     break
-
         except Exception:
             n_skipped += 1
             continue
 
-        if n_processed >= 30000:
+        if n_processed >= 20000:
             break
-        if (i + 1) % 500 == 0:
-            logger.info(f"  {i+1}/{len(ds)} records → {n_processed} segments...")
+        if n_processed % 500 == 0:
+            logger.info(f"  {n_processed} segments...")
 
     logger.info(f"Done: {n_processed} segments, {n_skipped} skipped")
-    unique, counts = np.unique(labels, return_counts=True)
-    class_names = ["NORM", "MI", "HYP", "STTC", "CD"]
-    for cls_id, cnt in zip(unique, counts):
-        logger.info(f"  Class {class_names[cls_id]}: {cnt} ({100*cnt/max(len(labels),1):.1f}%)")
 
-    # Stack and pad channels to 12
-    seg_array = np.stack(segments)
-    n_channels_actual = seg_array.shape[2]
-    if n_channels_actual < 12:
-        pad = np.zeros((seg_array.shape[0], seg_array.shape[1], 12 - n_channels_actual), dtype=np.float32)
-        seg_array = np.concatenate([seg_array, pad], axis=2)
+    # Stack: (N, 1, 5000) → pad to (N, 12, 5000)
+    seg_array = np.stack(segments)[:, np.newaxis, :]
+    pad = np.zeros((seg_array.shape[0], 11, seg_array.shape[2]), dtype=np.float32)
+    seg_array = np.concatenate([seg_array, pad], axis=1)
 
-    X = torch.from_numpy(seg_array).permute(0, 2, 1)  # (N, 12, 5000)
+    X = torch.from_numpy(seg_array)
     y = torch.tensor(labels, dtype=torch.long)
 
-    # Stratified split
+    # Split
     from sklearn.model_selection import train_test_split
     idx = np.arange(len(segments))
-    idx_train, idx_test = train_test_split(idx, test_size=0.2, stratify=labels, random_state=42)
-    idx_val, idx_test = train_test_split(idx_test, test_size=0.5,
-                                          stratify=np.array(labels)[idx_test], random_state=42)
+    idx_train, idx_test = train_test_split(idx, test_size=0.2, random_state=42)
+    idx_val, idx_test = train_test_split(idx_test, test_size=0.5, random_state=42)
 
     logger.info(f"Train: {len(idx_train)} | Val: {len(idx_val)} | Test: {len(idx_test)}")
-    logger.info(f"Avg R-peaks/segment: {np.mean(r_peak_counts):.1f}")
-
     return {
         "train": TensorDataset(X[idx_train], y[idx_train]),
         "val": TensorDataset(X[idx_val], y[idx_val]),
@@ -320,10 +326,6 @@ def load_ptbxl_from_hf(n_records: int = 5000) -> Dict:
         "X_test": X[idx_test], "y_test": y[idx_test],
         "X_train": X[idx_train], "y_train": y[idx_train],
     }
-
-
-# Global flag for multi-lead — set before load_ptbxl_from_hf
-use_multi_lead_ds = False
 
 
 # ============================================================
@@ -816,9 +818,8 @@ def main():
     setup()
 
     # Download data
-    logger.info("Preprocessing datasets...")
-    datasets_single = load_ptbxl_from_hf(n_records=5000)
-    datasets_multi = None
+    logger.info("Loading PTB-XL...")
+    datasets = load_ptbxl_from_wfdb(n_records=5000)
 
     all_results = []
 
@@ -831,17 +832,9 @@ def main():
         logger.info("=" * 60)
 
         if config_key == "E":
-            results = run_raw_signal_baseline(datasets_single)
+            results = run_raw_signal_baseline(datasets)
             all_results.append(results)
             continue
-
-        # Use multi-lead for Config D
-        global use_multi_lead_ds
-        if cfg.use_multi_lead and datasets_multi is None:
-            use_multi_lead_ds = True
-            datasets_multi = load_ptbxl_from_hf(n_records=5000)
-            use_multi_lead_ds = False
-        datasets = datasets_multi if cfg.use_multi_lead else datasets_single
 
         # Build & train
         model = build_model(cfg)
