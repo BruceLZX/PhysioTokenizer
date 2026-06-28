@@ -720,6 +720,7 @@ def generate_paper_figures(all_results: List[Dict]):
         "figure.dpi": 200,
     })
     figs_dir = Path("figures")
+    figs_dir.mkdir(parents=True, exist_ok=True)
 
     config_names = [r["config"] for r in all_results]
     colors = {"A": "#FF9800", "F": "#E91E63", "B": "#4CAF50", "C": "#2196F3", "D": "#9C27B0", "E": "#607D8B"}
@@ -730,15 +731,56 @@ def generate_paper_figures(all_results: List[Dict]):
                 return r.get(key, default)
         return default
 
-    # Fig 1: Reconstruction MSE comparison
-    fig, ax = plt.subplots(figsize=(7, 3.5))
     configs_order = ["A_FlatVQ", "F_MultiScaleVQ", "B_FreqBandVQ", "C_AdaptiveBoundary", "D_PhysioTokenizerFull"]
     labels = ["Flat VQ", "Multi-Scale\nVQ", "Freq-Band\nVQ", "+ Adaptive\nBoundary", "PhysioTokenizer\n(Full)"]
-    ax.bar(x[-1], fixed_patch, color="#FF5722", alpha=0.5, label="Fixed Patch (Sundial)")
+    clrs = [colors[c[0]] for c in ["A", "F", "B", "C", "D"]]
+    x = np.arange(len(configs_order))
+
+    # Fig 1: Reconstruction MSE comparison
+    fig, ax = plt.subplots(figsize=(7, 3.5))
+    recon_vals = [get_val([c], "recon_mse", 0) for c in configs_order]
+    ax.bar(x, recon_vals, color=clrs)
     ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.set_ylabel("Reconstruction MSE")
+    ax.set_title("Figure 1: Reconstruction Quality")
+    ax.tick_params(axis="x", rotation=15)
+    fig.tight_layout()
+    fig.savefig(figs_dir / "fig1_reconstruction.pdf"); fig.savefig(figs_dir / "fig1_reconstruction.png")
+    plt.close(fig)
+    logger.info("  fig1_reconstruction ✓")
+
+    # Fig 2: Downstream classification comparison
+    fig, ax = plt.subplots(figsize=(7, 3.5))
+    acc_vals = [get_val([c], "downstream_acc", 0) for c in configs_order]
+    f1_vals = [get_val([c], "downstream_f1_macro", 0) for c in configs_order]
+    width = 0.35
+    ax.bar(x - width / 2, acc_vals, width, label="Accuracy", color="#455A64")
+    ax.bar(x + width / 2, f1_vals, width, label="F1 Macro", color="#00897B")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.set_ylabel("Score")
+    ax.set_ylim(0, 1.0)
+    ax.set_title("Figure 2: Downstream Diagnostic Classification")
+    ax.tick_params(axis="x", rotation=15)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(figs_dir / "fig2_downstream.pdf"); fig.savefig(figs_dir / "fig2_downstream.png")
+    plt.close(fig)
+    logger.info("  fig2_downstream ✓")
+
+    # Fig 3: Token compression
+    fig, ax = plt.subplots(figsize=(7, 3.5))
+    token_vals = [get_val([c], "avg_tokens_per_segment", 0) for c in configs_order]
+    fixed_patch = 5000 / 16
+    x_with_ref = np.arange(len(configs_order) + 1)
+    ax.bar(x, token_vals, color=clrs)
+    ax.bar(x_with_ref[-1], fixed_patch, color="#FF5722", alpha=0.5, label="Fixed Patch (Sundial)")
+    ax.set_xticks(x_with_ref)
     ax.set_xticklabels(labels + ["Fixed\nPatch"])
     ax.set_ylabel("Average Tokens per 10s Segment")
     ax.set_title("Figure 3: Token Compression Efficiency")
+    ax.tick_params(axis="x", rotation=15)
     ax.legend(fontsize=7)
     fig.tight_layout()
     fig.savefig(figs_dir / "fig3_compression.pdf"); fig.savefig(figs_dir / "fig3_compression.png")
@@ -792,6 +834,8 @@ def main():
                         help="Which configs to run (default: all)")
     parser.add_argument("--skip-download", action="store_true",
                         help="Skip PTB-XL download")
+    parser.add_argument("--n-records", type=int, default=5000,
+                        help="Number of PTB-XL records to process (default: 5000)")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -800,7 +844,7 @@ def main():
 
     # Download data
     logger.info("Loading PTB-XL...")
-    datasets = load_ptbxl_from_wfdb(n_records=5000)
+    datasets = load_ptbxl_from_wfdb(n_records=args.n_records)
 
     # Resume from previous run
     all_results = []
@@ -830,6 +874,8 @@ def main():
         if config_key == "E":
             results = run_raw_signal_baseline(datasets)
             all_results.append(results)
+            with open("results/all_results.json", "w") as f:
+                json.dump(all_results, f, indent=2, default=str)
             continue
 
         # Build & train (or load checkpoint)
@@ -866,8 +912,23 @@ def main():
     for i in range(1, 6):
         logger.info(f"  \\includegraphics[width=\\columnwidth]{{figures/fig{i}_*.pdf}}")
 
+    make_results_archive()
+
     # Auto-push results to GitHub so data survives HF Space sleep
     push_results_to_github()
+
+
+def make_results_archive():
+    """Create a downloadable archive with all experiment artifacts."""
+    import tarfile
+
+    archive_path = Path("physiotokenizer_results.tar.gz")
+    with tarfile.open(archive_path, "w:gz") as tar:
+        for dirname in ["results", "figures", "checkpoints"]:
+            path = Path(dirname)
+            if path.exists():
+                tar.add(path, arcname=dirname)
+    logger.info(f"Results archive saved to {archive_path}")
 
 
 def push_results_to_github():
