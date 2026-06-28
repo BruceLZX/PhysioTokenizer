@@ -237,7 +237,24 @@ def load_ptbxl_from_wfdb(n_records: int = 5000) -> Dict:
     dat_files = sorted(data_dir.rglob("*.dat"))
     logger.info(f"Available: {len(dat_files)} records")
 
+    # Load PTB-XL labels from CSV
+    import pandas as pd
     label_to_idx = {"NORM": 0, "MI": 1, "HYP": 2, "STTC": 3, "CD": 4}
+    ecg_id_to_label = {}
+    for csv_path in data_dir.rglob("ptbxl_database.csv"):
+        df = pd.read_csv(csv_path)
+        for _, row in df.iterrows():
+            eid = str(int(row.get("ecg_id", 0)))
+            scp = str(row.get("diagnostic_class", "NORM")).upper()
+            for cls_name in label_to_idx:
+                if cls_name in scp:
+                    ecg_id_to_label[eid] = label_to_idx[cls_name]
+                    break
+            else:
+                ecg_id_to_label[eid] = 0
+        logger.info(f"Loaded {len(ecg_id_to_label)} labels from {csv_path.name}")
+        break
+
     segments, labels, r_peak_counts = [], [], []
     n_processed, n_skipped = 0, 0
     fs_target = 500
@@ -251,15 +268,9 @@ def load_ptbxl_from_wfdb(n_records: int = 5000) -> Dict:
             sig_raw = rec.p_signal.astype(np.float32)
             rec_fs = rec.fs
 
-            # Try to get label from filename
-            label = 0  # default NORM
-            if hasattr(rec, 'comments') and rec.comments:
-                for c in rec.comments:
-                    c_upper = str(c).upper()
-                    for cls_name, cls_id in label_to_idx.items():
-                        if cls_name in c_upper:
-                            label = cls_id
-                            break
+            # Get label: filename "00001_hr.dat" → ecg_id = "1"
+            ecg_id = str(int(dat_path.stem.split("_")[0]))  # "00001" → 1 → "1"
+            label = ecg_id_to_label.get(ecg_id, 0)
 
             # Lead I only (channel 0)
             sig = sig_raw[:, 0:1]
