@@ -237,22 +237,51 @@ def load_ptbxl_from_wfdb(n_records: int = 5000) -> Dict:
     dat_files = sorted(data_dir.rglob("*.dat"))
     logger.info(f"Available: {len(dat_files)} records")
 
-    # Load PTB-XL labels from CSV
+    # Load PTB-XL labels from CSV. PTB-XL stores statement likelihoods in
+    # ptbxl_database.scp_codes and maps those statements to diagnostic classes
+    # in scp_statements.csv.
+    import ast
     import pandas as pd
     label_to_idx = {"NORM": 0, "MI": 1, "HYP": 2, "STTC": 3, "CD": 4}
     ecg_id_to_label = {}
+    scp_to_class = {}
+    for stmt_path in data_dir.rglob("scp_statements.csv"):
+        stmt_df = pd.read_csv(stmt_path, index_col=0)
+        for code, row in stmt_df.iterrows():
+            diagnostic_class = str(row.get("diagnostic_class", "")).upper()
+            if diagnostic_class in label_to_idx:
+                scp_to_class[str(code).upper()] = diagnostic_class
+        logger.info(f"Loaded {len(scp_to_class)} diagnostic SCP mappings from {stmt_path.name}")
+        break
+
     for csv_path in data_dir.rglob("ptbxl_database.csv"):
         df = pd.read_csv(csv_path)
         for _, row in df.iterrows():
             eid = str(int(row.get("ecg_id", 0)))
-            scp = str(row.get("diagnostic_class", "NORM")).upper()
-            for cls_name in label_to_idx:
-                if cls_name in scp:
-                    ecg_id_to_label[eid] = label_to_idx[cls_name]
-                    break
+            try:
+                scp_codes = ast.literal_eval(str(row.get("scp_codes", "{}")))
+            except (ValueError, SyntaxError):
+                scp_codes = {}
+
+            candidates = []
+            for code, likelihood in scp_codes.items():
+                cls_name = scp_to_class.get(str(code).upper())
+                if cls_name is not None:
+                    candidates.append((float(likelihood), cls_name))
+
+            if candidates:
+                _, cls_name = max(candidates, key=lambda item: item[0])
+                ecg_id_to_label[eid] = label_to_idx[cls_name]
             else:
-                ecg_id_to_label[eid] = 0
+                ecg_id_to_label[eid] = label_to_idx["NORM"]
         logger.info(f"Loaded {len(ecg_id_to_label)} labels from {csv_path.name}")
+        label_counts = {name: 0 for name in label_to_idx}
+        for label in ecg_id_to_label.values():
+            for name, idx in label_to_idx.items():
+                if label == idx:
+                    label_counts[name] += 1
+                    break
+        logger.info(f"Label distribution: {label_counts}")
         break
 
     segments, labels, r_peak_counts = [], [], []
